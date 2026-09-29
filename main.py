@@ -142,8 +142,9 @@ def build_ffmpeg(info: dict[str, Any]) -> list[str]:
     cmd += ["-avoid_negative_ts", "make_zero"]
 
     variants = []
+    has_default = any(track["default"] for track in tracks)
     for i, track in enumerate(tracks):
-        default = "yes" if track["default"] else "no"
+        default = "yes" if (track["default"] or (not has_default and i == 0)) else "no"
         item = [f"a:{i}", "agroup:audio", f"default:{default}", f"name:audio_{i}"]
         language = re.sub(r"[^A-Za-z0-9-]", "", track["language"] or "")
         if language:
