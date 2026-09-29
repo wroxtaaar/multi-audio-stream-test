@@ -87,16 +87,38 @@
   }
 
   function setTracks(tracks) {
+    if (!Array.isArray(tracks) || tracks.length === 0) {
+      return;
+    }
+
     select.innerHTML = "";
     tracks.forEach((track, index) => {
       const option = document.createElement("option");
       option.value = String(index);
-      option.textContent = (track.name || track.title || ("Audio " + (index + 1))) +
-        (track.lang ? " (" + track.lang + ")" : "");
+      const name = track.name || track.title || track.lang || track.assocLang ||
+        ("Audio " + (index + 1));
+      option.textContent = name;
       select.appendChild(option);
     });
+
     select.disabled = tracks.length < 2;
     trackCount.textContent = tracks.length;
+
+    const current = Number.isInteger(hls?.audioTrack) && hls.audioTrack >= 0
+      ? hls.audioTrack
+      : 0;
+    if (current < tracks.length) {
+      select.value = String(current);
+    }
+  }
+
+  function syncHlsAudioTracks(tracks) {
+    const available = Array.isArray(tracks) && tracks.length
+      ? tracks
+      : (hls ? hls.audioTracks : []);
+    if (available && available.length) {
+      setTracks(available);
+    }
   }
 
   async function start() {
@@ -134,18 +156,36 @@
         hlsState.className = "ok";
       });
 
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        setTracks(hls.audioTracks.map((t, i) => ({
-          index: i,
-          name: t.name,
-          lang: t.lang || t.assocLang,
-        })));
-        hlsState.textContent = "ready";
-        hlsState.className = "ok";
-        status("Ready — press play", "ok");
+      hls.on(Hls.Events.MANIFEST_LOADED, (_event, data) => {
+        syncHlsAudioTracks(data?.audioTracks);
       });
 
-      hls.on(Hls.Events.AUDIO_TRACK_SWITCHING, () => {
+      hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_event, data) => {
+        syncHlsAudioTracks(data?.audioTracks);
+      });
+
+      hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+        syncHlsAudioTracks(data?.audioTracks);
+        syncHlsAudioTracks(hls.audioTracks);
+        hlsState.textContent = "ready";
+        hlsState.className = "ok";
+        status(
+          hls.audioTracks.length >= 2
+            ? "Ready — press play"
+            : "Video ready — loading audio tracks…",
+          "ok"
+        );
+
+        // Audio-track metadata may arrive just after MANIFEST_PARSED.
+        setTimeout(() => syncHlsAudioTracks(hls?.audioTracks), 250);
+        setTimeout(() => syncHlsAudioTracks(hls?.audioTracks), 1000);
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHING, (_event, data) => {
+        status("Switching audio " + (Number(data?.id) + 1) + "…");
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_event, data) => {
         status("Switching audio…");
       });
 
@@ -155,7 +195,12 @@
         status("Playing " + name, "ok");
       });
 
+      hls.on(Hls.Events.AUDIO_TRACK_LOADED, (_event, data) => {
+        syncHlsAudioTracks(hls.audioTracks);
+      });
+
       hls.on(Hls.Events.ERROR, (_event, data) => {
+        console.error("HLS", data.type, data.details, data);
         if (data.fatal) {
           hlsState.textContent = "fatal error";
           hlsState.className = "error";
