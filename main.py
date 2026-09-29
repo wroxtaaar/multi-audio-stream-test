@@ -18,10 +18,7 @@ from fastapi.staticfiles import StaticFiles
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 HLS_ROOT = Path(os.getenv("HLS_ROOT", "/tmp/multi-audio-hls"))
-MEDIA_SOURCE_URL = os.getenv(
-    "MEDIA_SOURCE_URL",
-    "https://new-test-dmkr.onrender.com/api/seedr/files/5999193299/download",
-).strip()
+MEDIA_SOURCE_URL = os.getenv("MEDIA_SOURCE_URL", "").strip()
 SEGMENT_SECONDS = max(2, int(os.getenv("HLS_SEGMENT_SECONDS", "4")))
 MAX_AUDIO_TRACKS = max(1, int(os.getenv("MAX_AUDIO_TRACKS", "8")))
 STARTUP_TIMEOUT = max(10, int(os.getenv("STARTUP_TIMEOUT", "45")))
@@ -191,7 +188,7 @@ async def probe(force: bool = False) -> dict[str, Any]:
     if _probe_cache is not None and not force:
         return _probe_cache
     if not MEDIA_SOURCE_URL.startswith(("http://", "https://")):
-        raise HTTPException(500, "MEDIA_SOURCE_URL must be an HTTP(S) URL")
+        raise HTTPException(500, "MEDIA_SOURCE_URL is not configured as an HTTP(S) URL")
 
     cmd = [
         "ffprobe", "-v", "error",
