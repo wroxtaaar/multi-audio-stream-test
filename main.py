@@ -6,6 +6,9 @@ import re
 import shutil
 import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -34,6 +37,132 @@ _ffmpeg: asyncio.subprocess.Process | None = None
 _ffmpeg_log_task: asyncio.Task | None = None
 _started_at: float | None = None
 _lock = asyncio.Lock()
+_smoke_test_result: dict[str, Any] | None = None
+_smoke_test_task: asyncio.Task | None = None
+
+
+async def direct_source_smoke_check() -> dict[str, Any]:
+    """Verify the direct Seedr URL from inside the Render container without downloading the file."""
+    parsed = urlparse(MEDIA_SOURCE_URL)
+    started = time.monotonic()
+    result: dict[str, Any] = {
+        "host": parsed.hostname,
+        "path": parsed.path,
+    }
+    try:
+        req = Request(
+            MEDIA_SOURCE_URL,
+            headers={
+                "User-Agent": "Mozilla/5.0 multi-audio-stream-test/1.0",
+                "Range": "bytes=0-65535",
+                "Accept": "*/*",
+            },
+            method="GET",
+        )
+        with urlopen(req, timeout=20) as response:
+            result.update({
+                "status": int(response.status),
+                "finalHost": urlparse(response.geturl()).hostname,
+                "contentType": response.headers.get("Content-Type"),
+                "contentLength": response.headers.get("Content-Length"),
+                "contentRange": response.headers.get("Content-Range"),
+                "acceptRanges": response.headers.get("Accept-Ranges"),
+                "sampleBytes": len(response.read(65536)),
+            })
+    except HTTPError as exc:
+        result.update({"status": exc.code, "error": f"HTTP {exc.code}: {exc.reason}"})
+    except (URLError, TimeoutError, OSError) as exc:
+        result["error"] = f"Network error: {exc}"
+    except Exception as exc:
+        result["error"] = f"Unexpected error: {type(exc).__name__}: {exc}"
+    result["elapsedMs"] = round((time.monotonic() - started) * 1000)
+    log.info("Direct source check: %s", json.dumps(result, sort_keys=True))
+    return result
+
+
+async def smoke_test() -> None:
+    global _smoke_test_result
+    started = time.monotonic()
+    try:
+        source = await direct_source_smoke_check()
+        if "status" not in source or source.get("status", 0) >= 400:
+            _smoke_test_result = {"ok": False, "stage": "http", "source": source}
+            return
+
+        info = await probe(force=True)
+        log.info(
+            "Smoke ffprobe: video=%s audio=%d duration=%s",
+            info["video"]["codec"], info["audioTrackCount"], info["duration"],
+        )
+        if not info["audioTracks"]:
+            _smoke_test_result = {"ok": False, "stage": "audio", "source": source, "probe": info}
+            return
+
+        await stop_ffmpeg(remove_files=True)
+        HLS_ROOT.mkdir(parents=True, exist_ok=True)
+        cmd = build_ffmpeg(info)
+        log.info("Smoke HLS: launching FFmpeg with %d audio track(s)", info["audioTrackCount"])
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=HLS_ROOT,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + min(25, STARTUP_TIMEOUT)
+            while time.monotonic() < deadline:
+                if proc.returncode is not None:
+                    _, err = await proc.communicate()
+                    _smoke_test_result = {
+                        "ok": False,
+                        "stage": "hls-process",
+                        "source": source,
+                        "probe": info,
+                        "exit": proc.returncode,
+                        "stderr": err.decode("utf-8", "replace")[-2500:],
+                    }
+                    return
+                master = HLS_ROOT / "master.m3u8"
+                if master.exists() and master.stat().st_size:
+                    text = master.read_text("utf-8", errors="replace")
+                    audio_lines = [
+                        line for line in text.splitlines()
+                        if line.startswith("#EXT-X-MEDIA") and "TYPE=AUDIO" in line
+                    ]
+                    uri_count = sum(1 for line in audio_lines if "URI=" in line)
+                    _smoke_test_result = {
+                        "ok": len(audio_lines) == info["audioTrackCount"] and uri_count == info["audioTrackCount"],
+                        "stage": "hls",
+                        "source": source,
+                        "probe": info,
+                        "audioRenditions": len(audio_lines),
+                        "audioPlaylistUris": uri_count,
+                        "master": text[:6000],
+                    }
+                    log.info(
+                        "Smoke HLS result: ok=%s renditions=%d uriCount=%d",
+                        _smoke_test_result["ok"], len(audio_lines), uri_count,
+                    )
+                    return
+                await asyncio.sleep(0.25)
+            _smoke_test_result = {"ok": False, "stage": "hls-timeout", "source": source, "probe": info}
+        finally:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), 3)
+                except Exception:
+                    proc.kill()
+                    await proc.wait()
+            shutil.rmtree(HLS_ROOT, ignore_errors=True)
+    except HTTPException as exc:
+        _smoke_test_result = {"ok": False, "stage": "probe", "status": exc.status_code, "detail": str(exc.detail)}
+        log.error("Smoke test failed: %s", _smoke_test_result)
+    except Exception as exc:
+        _smoke_test_result = {"ok": False, "stage": "unexpected", "error": f"{type(exc).__name__}: {exc}"}
+        log.exception("Smoke test failed unexpectedly")
+    finally:
+        log.info("Smoke test finished in %d ms", round((time.monotonic() - started) * 1000))
 
 
 def label_for(language: str, index: int) -> str:
@@ -282,7 +411,15 @@ async def api_info() -> dict[str, Any]:
         "ffmpegRunning": bool(_ffmpeg is not None and _ffmpeg.returncode is None),
         "startedAt": _started_at,
         "segmentSeconds": SEGMENT_SECONDS,
+        "smokeTest": _smoke_test_result,
     }
+
+
+@app.get("/api/self-test")
+async def api_self_test() -> dict[str, Any]:
+    """Run the integration smoke test on-demand from the Render instance."""
+    await smoke_test()
+    return _smoke_test_result or {"ok": False, "stage": "unknown"}
 
 
 @app.post("/api/start")
@@ -319,6 +456,13 @@ async def api_hls(path: str):
         text = rewrite_master(text, (await probe())["audioTracks"])
         return Response(text, media_type="application/vnd.apple.mpegurl", headers=headers)
     return FileResponse(target, media_type=mime_for(target), headers=headers)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    global _smoke_test_task
+    if os.getenv("RUN_STARTUP_SMOKE_TEST", "false").lower() in {"1", "true", "yes"}:
+        _smoke_test_task = asyncio.create_task(smoke_test())
 
 
 @app.on_event("shutdown")
