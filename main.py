@@ -144,7 +144,7 @@ def build_ffmpeg(info: dict[str, Any]) -> list[str]:
     variants = []
     for i, track in enumerate(tracks):
         default = "yes" if track["default"] else "no"
-        item = [f"a:{i}", "agroup:audio", f"default:{default}", f"name:track{i}"]
+        item = [f"a:{i}", "agroup:audio", f"default:{default}", f"name:audio_{i}"]
         language = re.sub(r"[^A-Za-z0-9-]", "", track["language"] or "")
         if language:
             item.append(f"language:{language}")
