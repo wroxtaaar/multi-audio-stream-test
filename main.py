@@ -597,6 +597,39 @@ async def api_hls(path: str):
     return FileResponse(target, media_type=mime_for(target), headers=headers)
 
 
+async def random_seek_benchmark() -> None:
+    """Measure FFmpeg input seeking at distant timestamps against the Seedr source."""
+    info = await probe()
+    for seconds in (60.0, 3600.0, 7200.0):
+        started = time.monotonic()
+        out_path = HLS_ROOT / f"seek-{int(seconds)}.mp4"
+        HLS_ROOT.mkdir(parents=True, exist_ok=True)
+        try:
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                "-ss", f"{seconds:.3f}", "-i", MEDIA_SOURCE_URL,
+                "-t", "4", "-map", "0:v:0",
+            ]
+            for track in info["audioTracks"]:
+                cmd += ["-map", f"0:{track['inputIndex']}"]
+            cmd += [
+                "-c:v", "copy",
+                "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "160k", "-ar", "48000",
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4", str(out_path),
+            ]
+            code, out, err = await run_command(cmd, 45)
+            elapsed = round((time.monotonic() - started) * 1000)
+            size = out_path.stat().st_size if out_path.exists() else 0
+            log.info(
+                "Random seek benchmark: t=%ss ok=%s elapsedMs=%s bytes=%s stderr=%s",
+                int(seconds), code == 0 and size > 0, elapsed, size, err[-800:].replace("\n", " | "),
+            )
+        finally:
+            out_path.unlink(missing_ok=True)
+
+
 @app.on_event("startup")
 async def startup() -> None:
     global _smoke_test_task, _hls_validation_task
@@ -612,6 +645,8 @@ async def startup() -> None:
                 _hls_validation_result = {"ok": False, "stage": "startup", "error": f"{type(exc).__name__}: {exc}"}
                 log.exception("Startup HLS validation failed")
         _hls_validation_task = asyncio.create_task(_run_validation())
+    if os.getenv("RUN_STARTUP_SEEK_BENCHMARK", "false").lower() in {"1", "true", "yes"}:
+        asyncio.create_task(random_seek_benchmark())
 
 
 @app.on_event("shutdown")
