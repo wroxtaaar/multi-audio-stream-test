@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Multi Audio Stream Test</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin:0; background:#101318; color:#f3f4f6; }
+    main { width:min(960px, calc(100% - 28px)); margin:24px auto 60px; }
+    h1 { margin-bottom:6px; } p { color:#aab1bd; }
+    .card { background:#181c23; border:1px solid #2a3039; border-radius:16px; padding:16px; margin-top:16px; }
+    video { width:100%; max-height:68vh; background:#000; border-radius:12px; display:block; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:14px; }
+    select, button { border:1px solid #3a414d; background:#0f1318; color:#f3f4f6; padding:10px 12px; border-radius:10px; }
+    button { cursor:pointer; } button:hover { background:#202630; }
+    label { font-weight:600; }
+    .status { margin-left:auto; font-size:13px; color:#8fd3ff; }
+    .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:12px; }
+    .metric { background:#10141a; border-radius:10px; padding:12px; }
+    .metric span { display:block; color:#7d8795; font-size:12px; margin-bottom:4px; }
+    .metric strong { font-variant-numeric:tabular-nums; }
+    .ok { color:#7ee787; } .warn { color:#ffd166; } .error { color:#ff7b72; }
+    @media (max-width:700px) { .grid { grid-template-columns:repeat(2,1fr); } .status { width:100%; margin-left:0; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Multi Audio Stream Test</h1>
+  <p>Seedr → FFmpeg HLS → HLS.js. The video source stays loaded while only the HLS audio rendition changes.</p>
+
+  <section class="card">
+    <video id="video" controls playsinline preload="metadata"></video>
+    <div class="row">
+      <label for="audioSelect">Audio</label>
+      <select id="audioSelect" disabled>
+        <option>Loading…</option>
+      </select>
+      <button id="reset">Reset stream</button>
+      <span id="status" class="status">Idle</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <strong>Diagnostics</strong>
+    <div class="grid">
+      <div class="metric"><span>Video time</span><strong id="videoTime">0.00s</strong></div>
+      <div class="metric"><span>Duration</span><strong id="duration">—</strong></div>
+      <div class="metric"><span>Audio tracks</span><strong id="trackCount">—</strong></div>
+      <div class="metric"><span>HLS state</span><strong id="hlsState">idle</strong></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <strong>Test procedure</strong>
+    <p>Start playback. Change Audio while the video is moving. A successful switch changes the language while keeping the same video timeline and without reloading the movie source.</p>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js"></script>
+<script>
+  const video = document.getElementById("video");
+  const select = document.getElementById("audioSelect");
+  const statusEl = document.getElementById("status");
+  const hlsState = document.getElementById("hlsState");
+  const videoTime = document.getElementById("videoTime");
+  const duration = document.getElementById("duration");
+  const trackCount = document.getElementById("trackCount");
+  const resetBtn = document.getElementById("reset");
+
+  let hls = null;
+  let streamInfo = null;
+
+  const status = (message, cls = "") => {
+    statusEl.textContent = message;
+    statusEl.className = "status " + cls;
+  };
+
+  async function loadInfo() {
+    const response = await fetch("/api/info", { cache: "no-store" });
+    if (!response.ok) throw new Error("Could not inspect source");
+    streamInfo = await response.json();
+    trackCount.textContent = streamInfo.audioTrackCount;
+    duration.textContent = Number.isFinite(streamInfo.duration)
+      ? streamInfo.duration.toFixed(1) + "s"
+      : "live/unknown";
+  }
+
+  function setTracks(tracks) {
+    select.innerHTML = "";
+    tracks.forEach((track, index) => {
+      const option = document.createElement("option");
+      option.value = String(index);
+      option.textContent = (track.name || track.title || ("Audio " + (index + 1))) +
+        (track.lang ? " (" + track.lang + ")" : "");
+      select.appendChild(option);
+    });
+    select.disabled = tracks.length < 2;
+    trackCount.textContent = tracks.length;
+  }
+
+  async function start() {
+    status("Preparing HLS…");
+    hlsState.textContent = "starting";
+    hlsState.className = "warn";
+
+    const response = await fetch("/api/start", { method: "POST" });
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(message || "Failed to start stream");
+    }
+
+    const info = await response.json();
+    streamInfo = { ...streamInfo, ...info };
+    trackCount.textContent = info.audioTrackCount;
+    duration.textContent = Number.isFinite(info.duration) ? info.duration.toFixed(1) + "s" : "live/unknown";
+
+    if (hls) {
+      hls.destroy();
+      hls = null;
+    }
+
+    if (window.Hls && Hls.isSupported()) {
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        backBufferLength: 60,
+        maxBufferLength: 30,
+        capLevelToPlayerSize: true,
+      });
+
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+        hlsState.textContent = "media attached";
+        hlsState.className = "ok";
+      });
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        setTracks(hls.audioTracks.map((t, i) => ({
+          index: i,
+          name: t.name,
+          lang: t.lang || t.assocLang,
+        })));
+        hlsState.textContent = "ready";
+        hlsState.className = "ok";
+        status("Ready — press play", "ok");
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHING, () => {
+        status("Switching audio…");
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_event, data) => {
+        const track = hls.audioTracks[data.id];
+        const name = track ? (track.name || track.lang || ("Audio " + (data.id + 1))) : "audio";
+        status("Playing " + name, "ok");
+      });
+
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) {
+          hlsState.textContent = "fatal error";
+          hlsState.className = "error";
+          status(data.details || "HLS error", "error");
+        }
+      });
+
+      hls.loadSource(info.hlsUrl + "?v=" + Date.now());
+      hls.attachMedia(video);
+      return;
+    }
+
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = info.hlsUrl + "?v=" + Date.now();
+      hlsState.textContent = "native HLS";
+      hlsState.className = "ok";
+      status("Native HLS ready. Use the browser/player audio selector.", "ok");
+      return;
+    }
+
+    throw new Error("This browser cannot play HLS.");
+  }
+
+  select.addEventListener("change", () => {
+    if (!hls) return;
+    const next = Number(select.value);
+    if (!Number.isInteger(next)) return;
+    // Critical: do NOT change video.src, call load(), or recreate Hls.
+    hls.nextAudioTrack = next;
+  });
+
+  video.addEventListener("timeupdate", () => {
+    videoTime.textContent = Number.isFinite(video.currentTime) ? video.currentTime.toFixed(2) + "s" : "—";
+  });
+  video.addEventListener("play", () => status("Playing", "ok"));
+  video.addEventListener("pause", () => status("Paused"));
+
+  resetBtn.addEventListener("click", async () => {
+    await fetch("/api/reset", { method: "POST" });
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+    if (hls) { hls.destroy(); hls = null; }
+    setTracks([]);
+    trackCount.textContent = "—";
+    duration.textContent = "—";
+    hlsState.textContent = "reset";
+    hlsState.className = "";
+    status("Reset");
+    await loadInfo();
+    await start();
+  });
+
+  (async () => {
+    try {
+      await loadInfo();
+      await start();
+    } catch (error) {
+      console.error(error);
+      status(error?.message || "Startup failed", "error");
+      hlsState.textContent = "failed";
+      hlsState.className = "error";
+    }
+  })();
+</script>
+</body>
+</html>

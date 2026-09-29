@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: multi-audio-stream-test
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: MEDIA_SOURCE_URL
+        value: "https://new-test-dmkr.onrender.com/api/seedr/files/5999193299/download"
+      - key: HLS_SEGMENT_SECONDS
+        value: "4"
+      - key: MAX_AUDIO_TRACKS
+        value: "8"
+      - key: STARTUP_TIMEOUT
+        value: "45"
