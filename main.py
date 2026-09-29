@@ -97,7 +97,7 @@ async def validate_hls_output(info: dict[str, Any]) -> dict[str, Any]:
         master_text = master.read_text("utf-8", errors="replace")
         result["master"] = master_text[:12000]
         lines = [line.strip() for line in master_text.splitlines() if line.strip()]
-        audio_uris = re.findall(r'TYPE=AUDIO,[^\\n]*URI="([^"]+)"', master_text)
+        audio_uris = re.findall(r'TYPE=AUDIO,[^\n]*URI="([^"]+)"', master_text)
         video_uris = []
         for idx, line in enumerate(lines):
             if line.startswith("#EXT-X-STREAM-INF:") and idx + 1 < len(lines):
@@ -108,6 +108,12 @@ async def validate_hls_output(info: dict[str, Any]) -> dict[str, Any]:
         result["playlistUris"] = playlist_uris
         result["files"] = {}
         failures = []
+
+        playlist_deadline = time.monotonic() + 8
+        while time.monotonic() < playlist_deadline:
+            if all((HLS_ROOT / rel).is_file() for rel in playlist_uris):
+                break
+            await asyncio.sleep(0.25)
 
         for rel in playlist_uris:
             path = (HLS_ROOT / rel).resolve()
@@ -208,7 +214,7 @@ async def smoke_test() -> None:
                     ]
                     uri_count = sum(1 for line in audio_lines if "URI=" in line)
                     _smoke_test_result = {
-                        "ok": len(audio_lines) == info["audioTrackCount"] and uri_count == info["audioTrackCount"],
+                        "ok": len(audio_lines) == info["audioTrackCount"] and uri_count == info["audioTrackCount"] and "#EXT-X-STREAM-INF:" in text,
                         "stage": "hls",
                         "source": source,
                         "probe": info,
@@ -343,12 +349,13 @@ def build_ffmpeg(info: dict[str, Any]) -> list[str]:
     video_bitrate = max(500000, int(info["video"].get("bitrate") or 5000000))
     cmd += ["-c:v", "copy", "-b:v:0", str(video_bitrate)]
     for i, track in enumerate(tracks):
-        if track["codec"] == "aac":
-            bitrate = max(64000, int(track.get("bitrate") or (384000 if track["channels"] >= 6 else 160000)))
-            cmd += [f"-c:a:{i}", "copy", f"-b:a:{i}", str(bitrate)]
-        else:
-            bitrate = 384000 if track["channels"] >= 6 else 160000
-            cmd += [f"-c:a:{i}", "aac", f"-b:a:{i}", str(bitrate), f"-ar:a:{i}", "48000"]
+        bitrate = 384000 if track["channels"] >= 6 else 160000
+        cmd += [
+            f"-c:a:{i}", "aac",
+            f"-profile:a:{i}", "aac_low",
+            f"-b:a:{i}", str(bitrate),
+            f"-ar:a:{i}", "48000",
+        ]
     cmd += ["-avoid_negative_ts", "make_zero"]
 
     variants = []
