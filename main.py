@@ -36,6 +36,8 @@ _started_at: float | None = None
 _lock = asyncio.Lock()
 _smoke_test_result: dict[str, Any] | None = None
 _smoke_test_task: asyncio.Task | None = None
+_hls_validation_result: dict[str, Any] | None = None
+_hls_validation_task: asyncio.Task | None = None
 
 
 async def direct_source_smoke_check() -> dict[str, Any]:
@@ -75,6 +77,79 @@ async def direct_source_smoke_check() -> dict[str, Any]:
     result["elapsedMs"] = round((time.monotonic() - started) * 1000)
     log.info("Direct source check: %s", json.dumps(result, sort_keys=True))
     return result
+
+
+async def validate_hls_output(info: dict[str, Any]) -> dict[str, Any]:
+    """Validate the actual HLS playlists produced on disk, not just the master tags."""
+    started = time.monotonic()
+    result: dict[str, Any] = {"ok": False, "tracks": info["audioTrackCount"]}
+    master = HLS_ROOT / "master.m3u8"
+    try:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if master.exists() and master.stat().st_size:
+                break
+            await asyncio.sleep(0.25)
+        if not master.exists():
+            result["stage"] = "master-missing"
+            return result
+
+        master_text = master.read_text("utf-8", errors="replace")
+        result["master"] = master_text[:12000]
+        audio_uris = re.findall(r'TYPE=AUDIO,[^\\n]*\\bURI="([^"]+)"', master_text)
+        video_uris = [
+            line.strip() for line in master_text.splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        playlist_uris = list(dict.fromkeys(audio_uris + video_uris))
+        result["playlistUris"] = playlist_uris
+        result["files"] = {}
+        failures = []
+
+        for rel in playlist_uris:
+            path = (HLS_ROOT / rel).resolve()
+            root = HLS_ROOT.resolve()
+            if path != root and root not in path.parents:
+                failures.append({"playlist": rel, "error": "unsafe path"})
+                continue
+            exists = path.is_file()
+            entry: dict[str, Any] = {"exists": exists, "size": path.stat().st_size if exists else 0}
+            if exists:
+                playlist = path.read_text("utf-8", errors="replace")
+                entry["text"] = playlist[:12000]
+                segments = [
+                    x.strip() for x in playlist.splitlines()
+                    if x.strip() and not x.startswith("#")
+                ]
+                entry["segments"] = segments[:3]
+                entry["segmentFiles"] = []
+                for seg in segments[:3]:
+                    seg_path = (path.parent / seg).resolve()
+                    seg_entry = {"name": seg, "exists": seg_path.is_file(), "size": seg_path.stat().st_size if seg_path.is_file() else 0}
+                    entry["segmentFiles"].append(seg_entry)
+                    if not seg_path.is_file():
+                        failures.append({"playlist": rel, "segment": seg, "error": "segment missing"})
+                code, out, err = await run_command([
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "stream=index,codec_type,codec_name,channels,sample_rate",
+                    "-of", "json", str(path)
+                ], 15)
+                entry["ffprobeCode"] = code
+                entry["ffprobe"] = out[-8000:]
+                entry["ffprobeError"] = err[-3000:]
+                if code != 0:
+                    failures.append({"playlist": rel, "error": "ffprobe failed", "stderr": err[-1000:]})
+            else:
+                failures.append({"playlist": rel, "error": "playlist missing"})
+            result["files"][rel] = entry
+
+        result["failures"] = failures
+        result["ok"] = not failures and len(audio_uris) == info["audioTrackCount"]
+        log.info("HLS validation: %s", json.dumps(result, sort_keys=True)[:30000])
+        return result
+    finally:
+        result["elapsedMs"] = round((time.monotonic() - started) * 1000)
+        log.info("HLS validation finished in %d ms ok=%s", result["elapsedMs"], result.get("ok"))
 
 
 async def smoke_test() -> None:
@@ -409,7 +484,16 @@ async def api_info() -> dict[str, Any]:
         "startedAt": _started_at,
         "segmentSeconds": SEGMENT_SECONDS,
         "smokeTest": _smoke_test_result,
+        "hlsValidation": _hls_validation_result,
     }
+
+
+@app.get("/api/validate-hls")
+async def api_validate_hls() -> dict[str, Any]:
+    global _hls_validation_result
+    info = await ensure_hls()
+    _hls_validation_result = await validate_hls_output(info)
+    return _hls_validation_result
 
 
 @app.get("/api/self-test")
@@ -457,9 +541,19 @@ async def api_hls(path: str):
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _smoke_test_task
+    global _smoke_test_task, _hls_validation_task
     if os.getenv("RUN_STARTUP_SMOKE_TEST", "false").lower() in {"1", "true", "yes"}:
         _smoke_test_task = asyncio.create_task(smoke_test())
+    if os.getenv("RUN_STARTUP_HLS_VALIDATE", "false").lower() in {"1", "true", "yes"}:
+        async def _run_validation() -> None:
+            global _hls_validation_result
+            try:
+                info = await ensure_hls()
+                _hls_validation_result = await validate_hls_output(info)
+            except Exception as exc:
+                _hls_validation_result = {"ok": False, "stage": "startup", "error": f"{type(exc).__name__}: {exc}"}
+                log.exception("Startup HLS validation failed")
+        _hls_validation_task = asyncio.create_task(_run_validation())
 
 
 @app.on_event("shutdown")
