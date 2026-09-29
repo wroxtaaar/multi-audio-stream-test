@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -502,6 +502,48 @@ async def api_info() -> dict[str, Any]:
         "smokeTest": _smoke_test_result,
         "hlsValidation": _hls_validation_result,
     }
+
+
+@app.get("/api/seek-test")
+async def api_seek_test(seconds: float = Query(3600.0, ge=0, le=8575.0)) -> dict[str, Any]:
+    """Measure random-access seek from the direct Seedr HTTP source."""
+    info = await probe()
+    started = time.monotonic()
+    out_path = HLS_ROOT / "seek-test.mp4"
+    HLS_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-ss", f"{seconds:.3f}",
+            "-i", MEDIA_SOURCE_URL,
+            "-t", "4",
+            "-map", "0:v:0",
+        ]
+        for track in info["audioTracks"]:
+            cmd += ["-map", f"0:{track['inputIndex']}"]
+        cmd += [
+            "-c:v", "copy",
+            "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "160k", "-ar", "48000",
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4", str(out_path),
+        ]
+        code, out, err = await run_command(cmd, 45)
+        elapsed = round((time.monotonic() - started) * 1000)
+        if code != 0 or not out_path.exists():
+            return {"ok": False, "seconds": seconds, "elapsedMs": elapsed, "exit": code, "stderr": err[-4000:]}
+        size = out_path.stat().st_size
+        return {
+            "ok": True,
+            "seconds": seconds,
+            "elapsedMs": elapsed,
+            "bytes": size,
+            "video": info["video"],
+            "audioTracks": info["audioTrackCount"],
+            "ffmpegStderr": err[-3000:],
+        }
+    finally:
+        out_path.unlink(missing_ok=True)
 
 
 @app.get("/api/validate-hls")
