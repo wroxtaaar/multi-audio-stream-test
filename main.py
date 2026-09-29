@@ -96,11 +96,14 @@ async def validate_hls_output(info: dict[str, Any]) -> dict[str, Any]:
 
         master_text = master.read_text("utf-8", errors="replace")
         result["master"] = master_text[:12000]
-        audio_uris = re.findall(r'TYPE=AUDIO,[^\\n]*\\bURI="([^"]+)"', master_text)
-        video_uris = [
-            line.strip() for line in master_text.splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
+        lines = [line.strip() for line in master_text.splitlines() if line.strip()]
+        audio_uris = re.findall(r'TYPE=AUDIO,[^\\n]*URI="([^"]+)"', master_text)
+        video_uris = []
+        for idx, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF:") and idx + 1 < len(lines):
+                candidate = lines[idx + 1]
+                if not candidate.startswith("#"):
+                    video_uris.append(candidate)
         playlist_uris = list(dict.fromkeys(audio_uris + video_uris))
         result["playlistUris"] = playlist_uris
         result["files"] = {}
@@ -144,7 +147,9 @@ async def validate_hls_output(info: dict[str, Any]) -> dict[str, Any]:
             result["files"][rel] = entry
 
         result["failures"] = failures
-        result["ok"] = not failures and len(audio_uris) == info["audioTrackCount"]
+        if not video_uris:
+            failures.append({"error": "video variant missing from master playlist"})
+        result["ok"] = not failures and len(audio_uris) == info["audioTrackCount"] and len(video_uris) >= 1
         log.info("HLS validation: %s", json.dumps(result, sort_keys=True)[:30000])
         return result
     finally:
@@ -268,7 +273,7 @@ async def probe(force: bool = False) -> dict[str, Any]:
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries",
-        "format=duration:stream=index,codec_type,codec_name,codec_long_name,channels,sample_rate:stream_tags=language,title:stream_disposition=default",
+        "format=duration:stream=index,codec_type,codec_name,codec_long_name,channels,sample_rate,bit_rate:stream_tags=language,title:stream_disposition=default",
         "-of", "json", MEDIA_SOURCE_URL,
     ]
     code, out, err = await run_command(cmd, 35)
@@ -300,6 +305,7 @@ async def probe(force: bool = False) -> dict[str, Any]:
             "codecLong": str(stream.get("codec_long_name") or ""),
             "channels": int(stream.get("channels") or 0),
             "sampleRate": int(stream.get("sample_rate") or 0),
+            "bitrate": int(stream.get("bit_rate") or 0),
             "default": bool(disp.get("default")),
         })
 
@@ -314,6 +320,7 @@ async def probe(force: bool = False) -> dict[str, Any]:
             "inputIndex": int(videos[0]["index"]),
             "codec": str(videos[0].get("codec_name") or ""),
             "codecLong": str(videos[0].get("codec_long_name") or ""),
+            "bitrate": int(videos[0].get("bit_rate") or 5000000),
         },
         "audioTracks": tracks,
         "audioTrackCount": len(tracks),
@@ -333,13 +340,15 @@ def build_ffmpeg(info: dict[str, Any]) -> list[str]:
     for track in tracks:
         cmd += ["-map", f"0:{track['inputIndex']}"]
 
-    cmd += ["-c:v", "copy"]
+    video_bitrate = max(500000, int(info["video"].get("bitrate") or 5000000))
+    cmd += ["-c:v", "copy", "-b:v:0", str(video_bitrate)]
     for i, track in enumerate(tracks):
         if track["codec"] == "aac":
-            cmd += [f"-c:a:{i}", "copy"]
+            bitrate = max(64000, int(track.get("bitrate") or (384000 if track["channels"] >= 6 else 160000)))
+            cmd += [f"-c:a:{i}", "copy", f"-b:a:{i}", str(bitrate)]
         else:
-            bitrate = "384k" if track["channels"] >= 6 else "160k"
-            cmd += [f"-c:a:{i}", "aac", f"-b:a:{i}", bitrate, f"-ar:a:{i}", "48000"]
+            bitrate = 384000 if track["channels"] >= 6 else 160000
+            cmd += [f"-c:a:{i}", "aac", f"-b:a:{i}", str(bitrate), f"-ar:a:{i}", "48000"]
     cmd += ["-avoid_negative_ts", "make_zero"]
 
     variants = []
